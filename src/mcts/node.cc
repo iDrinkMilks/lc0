@@ -30,6 +30,7 @@
 #include <absl/algorithm/container.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -121,11 +122,70 @@ std::unique_ptr<Edge[]> Edge::FromMovelist(const MoveList& moves) {
 // LowNode + Node
 /////////////////////////////////////////////////////////////////////////
 
-void Node::Trim() {
+Node& Node::operator=(Node&& move_from) {  // Race expected.
+  assert(move_from.Realized());
+
+  // Try to lock others out.
+  uint16_t expected_index = magic_index_constructed_;
+  if (!index_.compare_exchange_strong(expected_index, magic_index_assigned_)) {
+    // Someone was faster, wait for them to finish.
+    do {
+      // EMPTY
+    } while (!Realized());
+
+    return *this;
+  }
+
+  wl_ = move_from.wl_;
+
+  // Move low node over without updating it using Get/SetLowNode.
+  low_node_ = move_from.low_node_;
+  move_from.low_node_ = nullptr;
+
+  d_ = move_from.d_;
+  m_ = move_from.m_;
+  n_ = move_from.n_;
+  n_in_flight_.store(move_from.n_in_flight_.load(std::memory_order_acquire),
+                     std::memory_order_release);
+
+  edge_ = move_from.edge_;
+
+  // index_ is updated last.
+
+  terminal_type_ = move_from.terminal_type_;
+  lower_bound_ = move_from.lower_bound_;
+  upper_bound_ = move_from.upper_bound_;
+
+  // Unlock node and make it Realized().
+  index_.store(move_from.index_.load(std::memory_order_acquire),
+               std::memory_order_release);
+
+  return *this;
+}
+
+void Node::Reset() {  // No race expected.
   wl_ = 0.0f;
 
   UnsetLowNode();
-  // sibling_
+
+  d_ = 0.0f;
+  m_ = 0.0f;
+  n_ = 0;
+  n_in_flight_ = 0;
+
+  edge_ = Edge();
+
+  index_.store(magic_index_constructed_, std::memory_order_relaxed);
+
+  terminal_type_ = Terminal::NonTerminal;
+  lower_bound_ = GameResult::BLACK_WON;
+  upper_bound_ = GameResult::WHITE_WON;
+}
+
+void Node::Trim() {  // No race expected.
+  wl_ = 0.0f;
+
+  UnsetLowNode();
 
   d_ = 0.0f;
   m_ = 0.0f;
@@ -143,7 +203,7 @@ void Node::Trim() {
 
 Node* Node::GetChild() const {
   if (!low_node_) return nullptr;
-  return low_node_->GetChild()->get();
+  return low_node_->GetChild();
 }
 
 bool Node::HasChildren() const { return low_node_ && low_node_->HasChildren(); }
@@ -172,8 +232,8 @@ std::string Node::DebugString() const {
   std::ostringstream oss;
   oss << " <Node> This:" << this << " LowNode:" << low_node_
       << " Index:" << index_ << " Move:" << GetMove().as_string()
-      << " Sibling:" << sibling_.get() << " P:" << GetP() << " WL:" << wl_
-      << " D:" << d_ << " M:" << m_ << " N:" << n_ << " N_:" << n_in_flight_
+      << " P:" << GetP() << " WL:" << wl_ << " D:" << d_ << " M:" << m_
+      << " N:" << n_ << " N_:" << n_in_flight_
       << " Term:" << static_cast<int>(terminal_type_)
       << " Bounds:" << static_cast<int>(lower_bound_) - 2 << ","
       << static_cast<int>(upper_bound_) - 2;
@@ -184,8 +244,8 @@ std::string LowNode::DebugString() const {
   std::ostringstream oss;
   oss << " <LowNode> This:" << this << " Edges:" << edges_.get()
       << " NumEdges:" << static_cast<int>(num_edges_)
-      << " Child:" << child_.get() << " WL:" << wl_ << " D:" << d_
-      << " M:" << m_ << " N:" << n_ << " N_:" << n_in_flight_
+      << " AllocatedChildren:" << allocated_children_ << " WL:" << wl_
+      << " D:" << d_ << " M:" << m_ << " N:" << n_ << " N_:" << n_in_flight_
       << " NP:" << static_cast<int>(num_parents_)
       << " Term:" << static_cast<int>(terminal_type_)
       << " Bounds:" << static_cast<int>(lower_bound_) - 2 << ","
@@ -382,26 +442,6 @@ void Node::IncrementNInFlight(int multivisit) {
   n_in_flight_.fetch_add(multivisit, std::memory_order_acq_rel);
 }
 
-void LowNode::ReleaseChildren() { child_.reset(); }
-
-void LowNode::ReleaseChildrenExceptOne(Node* node_to_save) {
-  // Stores node which will have to survive (or nullptr if it's not found).
-  atomic_unique_ptr<Node> saved_node;
-  // Pointer to unique_ptr, so that we could move from it.
-  for (auto node = &child_; *node; node = (*node)->GetSibling()) {
-    // If current node is the one that we have to save.
-    if (node->get() == node_to_save) {
-      // Kill all remaining siblings.
-      (*(*node)->GetSibling()).reset();
-      // Save the node, and take the ownership from the unique_ptr.
-      saved_node = std::move(*node);
-      break;
-    }
-  }
-  // Make saved node the only child. (kills previous siblings).
-  child_ = std::move(saved_node);
-}
-
 void Node::ReleaseChildrenExceptOne(Node* node_to_save) const {
   // Sometime we have no graph yet or a reverted terminal without low node.
   if (low_node_) low_node_->ReleaseChildrenExceptOne(node_to_save);
@@ -451,7 +491,7 @@ std::string LowNode::DotNodeString() const {
       << std::noshowpos                             //
       << "\\n\\nThis=" << this << "\\nEdges=" << edges_.get()
       << "\\nNumEdges=" << static_cast<int>(num_edges_)
-      << "\\nChild=" << child_.get() << "\\n\"";
+      << "\\nAllocatedChildren=" << allocated_children_ << "\\n\"";
   oss << "];";
   return oss.str();
 }
@@ -479,7 +519,7 @@ std::string Node::DotEdgeString(bool as_opponent, const LowNode* parent) const {
       << static_cast<int>(upper_bound_) - 2 << "\\n\\nThis=" << this  //
       << std::noshowpos                                               //
       << "\\nLowNode=" << low_node_ << "\\nParent=" << parent
-      << "\\nIndex=" << index_ << "\\nSibling=" << sibling_.get() << "\\n\"";
+      << "\\nIndex=" << index_ << "\\n\"";
   oss << "];";
   return oss.str();
 }
@@ -592,6 +632,138 @@ void Node::SortEdges() const {
   low_node_->SortEdges();
 }
 
+void LowNode::ReleaseChildren() {  // No race expected.
+  auto allocated = allocated_children_.load(std::memory_order_relaxed);
+  std::allocator<Node> alloc;
+
+  if (allocated > children_3_end_) {
+    auto children = children_4_.exchange(nullptr, std::memory_order_release);
+    alloc.deallocate(children, allocated - children_3_end_);
+  }
+  if (allocated > children_2_end_) {
+    auto children = children_3_.exchange(nullptr, std::memory_order_release);
+    alloc.deallocate(children, children_3_size_);
+  }
+  if (allocated > children_1_end_) {
+    auto children = children_2_.exchange(nullptr, std::memory_order_release);
+    alloc.deallocate(children, children_2_size_);
+  }
+  for (uint16_t i = 0; i < children_1_end_; ++i) {
+    children_1_[i].Reset();
+  }
+
+  allocated_children_.store(preallocated_children_, std::memory_order_relaxed);
+}
+
+void LowNode::ReleaseChildrenExceptOne(
+    Node* child_to_save) {  // No race expected.
+  assert(child_to_save != nullptr);
+  // Save node's content.
+  Node saved_child = std::move(*child_to_save);
+  // Release all children to maybe save memory.
+  ReleaseChildren();
+  // Recreate child.
+  auto new_child = InsertChildAt(saved_child.Index());
+  *new_child = std::move(saved_child);
+}
+
+Node* LowNode::GetChild() {
+  for (uint16_t i = 0; i < allocated_children_; ++i) {
+    auto child = GetChildAt(i);
+    if (child) return child;
+  }
+
+  return nullptr;
+}
+
+Node* LowNode::FindPlaceOf(uint16_t index) {
+  // Find the right child group for the index.
+  if (index < children_1_end_) {
+    return &children_1_[index];
+  } else if (index < children_2_end_) {
+    return &children_2_[index - children_1_end_];
+  } else if (index < children_3_end_) {
+    return &children_3_[index - children_2_end_];
+  } else {
+    return &children_4_[index - children_3_end_];
+  }
+}
+
+Node* LowNode::GetChildAt(uint16_t index) {  // Race expected.
+  // Make sure we are looking for a possible realized child.
+  if (index >= allocated_children_.load(std::memory_order_acquire))
+    return nullptr;
+
+  // Find place with child.
+  Node* child = FindPlaceOf(index);
+
+  // Return child, if realized.
+  if (child->Realized()) return child;
+
+  return nullptr;
+}
+
+void LowNode::Allocate(uint16_t size, uint16_t* already_allocated,
+                       std::atomic<Node*>* children) {  // Race expected.
+  Node* expected_array = nullptr;
+  auto target_allocated = *already_allocated + size;
+
+  // Optimistically allocate and initialize a new array.
+  std::allocator<Node> alloc;
+  auto array = alloc.allocate(size);
+  for (uint16_t i = 0; i < size; ++i) {
+    new (&array[i]) Node();
+  }
+
+  // Setting array either succeeds or someone else was faster.
+  if (children->compare_exchange_strong(expected_array, array,
+                                        std::memory_order_acq_rel)) {
+    // No one should be updating allocated children count as they would be
+    // trying to set the same array and failing.
+    allocated_children_.store(target_allocated, std::memory_order_release);
+    *already_allocated = target_allocated;
+  } else {
+    // Free unused new array.
+    alloc.deallocate(array, size);
+
+    // Have to wait until allocated children count is updated. Others might even
+    // be able to allocate more than one array.
+    do {
+      *already_allocated = allocated_children_.load(std::memory_order_acquire);
+    } while (*already_allocated < target_allocated);
+  }
+}
+
+Node* LowNode::InsertChildAt(uint16_t index) {  // Race expected.
+  assert(edges_);
+  assert(index < num_edges_);
+
+  // Allocate memory for all missing child arrays needed.
+  auto allocated = allocated_children_.load(std::memory_order_acquire);
+  if (index >= allocated) {
+    if (allocated < children_2_end_) {
+      Allocate(children_2_size_, &allocated, &children_2_);
+    }
+    if (index >= allocated && allocated < children_3_end_) {
+      Allocate(children_3_size_, &allocated, &children_3_);
+    }
+    if (index >= allocated) {
+      Allocate(num_edges_ - children_3_end_, &allocated, &children_4_);
+    }
+  }
+
+  // Find place with child.
+  Node* child = FindPlaceOf(index);
+
+  // Realize child if needed.
+  if (!child->Realized()) {
+    // This either succeeds or someone else is faster and does the same.
+    *child = Node(edges_[index], index);
+  }
+
+  return child;
+}
+
 /////////////////////////////////////////////////////////////////////////
 // EdgeAndNode
 /////////////////////////////////////////////////////////////////////////
@@ -614,7 +786,7 @@ void NodeTree::MakeMove(Move move) {
   Node* new_head = nullptr;
   for (auto& n : current_head_->Edges()) {
     if (board.IsSameMove(n.GetMove(), move)) {
-      new_head = n.GetOrSpawnNode(current_head_);
+      new_head = n.GetOrSpawnNode();
       // Ensure head is not terminal, so search can extend or visit children of
       // "terminal" positions, e.g., WDL hits, converted terminals, 3-fold draw.
       if (new_head->IsTerminal()) new_head->MakeNotTerminal();
@@ -658,7 +830,7 @@ bool NodeTree::ResetToPosition(const std::string& starting_fen,
   }
 
   if (!gamebegin_node_) {
-    gamebegin_node_ = std::make_unique<Node>(0);
+    gamebegin_node_ = std::make_unique<Node>();
   }
 
   history_.Reset(starting_board, no_capture_ply,

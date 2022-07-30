@@ -1707,7 +1707,7 @@ void SearchWorker::PickNodesToExtendTask(
         (*visits_to_perform.back())[best_idx] += new_visits;
         cur_limit -= new_visits;
 
-        Node* child_node = best_edge.GetOrSpawnNode(/* parent */ node);
+        Node* child_node = best_edge.GetOrSpawnNode();
         history.Append(best_edge.GetMove());
         auto [child_repetitions, child_moves_left] =
             GetRepetitions(full_path.size(), history.Last());
@@ -1748,7 +1748,7 @@ void SearchWorker::PickNodesToExtendTask(
             child_limit + passed_off + completed_visits <
                 collision_limit -
                     params_.GetMinimumRemainingWorkSizeForPicking()) {
-          Node* child_node = cur_iters[i].GetOrSpawnNode(/* parent */ node);
+          Node* child_node = cur_iters[i].GetOrSpawnNode();
           history.Append(cur_iters[i].GetMove());
           auto [child_repetitions, child_moves_left] =
               GetRepetitions(full_path.size(), history.Last());
@@ -1788,7 +1788,7 @@ void SearchWorker::PickNodesToExtendTask(
         if (idx > min_idx && (*visits_to_perform.back())[idx] > 0) {
           current_path.back() = idx;
           current_path.push_back(-1);
-          node = child.GetOrSpawnNode(/* parent */ node);
+          node = child.GetOrSpawnNode();
           history.Append(child.GetMove());
           std::tie(repetitions, moves_left) =
               GetRepetitions(full_path.size(), history.Last());

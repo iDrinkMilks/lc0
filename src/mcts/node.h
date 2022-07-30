@@ -30,6 +30,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -44,15 +45,16 @@
 namespace lczero {
 
 // Terminology:
-// * Edge - a potential edge with a move and policy information.
-// * Node - an existing edge with number of visits and evaluation.
+// * Edge    - a potential edge with a move and policy information.
+// * Node    - a realized edge with number of visits and evaluation.
 // * LowNode - a node with number of visits, evaluation and edges.
 //
 // Storage:
 // * Potential edges are stored in a simple array inside the LowNode as edges_.
-// * Existing edges are stored in a linked list starting with a child_ pointer
-//   in the LowNode and continuing with a sibling_ pointer in each Node.
-// * Existing edges have a copy of their potential edge counterpart, index_
+// * Realized edges are stored at index they have in edges_ in a logical array
+//   stored in LowNode as a single static and several dynamic arrays, allocated
+//   on-demand.
+// * Realized edges have a copy of their potential edge counterpart, index_
 //   among potential edges and are linked to the target LowNode via the
 //   low_node_ pointer.
 //
@@ -68,21 +70,23 @@ namespace lczero {
 //  Is represented as:
 // +-----------------+
 // | LowNode         |
-// +-----------------+                                        +--------+
-// | edges_          | -------------------------------------> | Edge[] |
-// |                 |    +------------+                      +--------+
-// | child_          | -> | Node       |                      | Nf3    |
-// |                 |    +------------+                      | Bc5    |
-// | ...             |    | edge_      |                      | a4     |
-// |                 |    | index_ = 1 |                      | Qxf7   |
-// |                 |    | q_ = 0.5   |    +------------+    | a3     |
-// |                 |    | sibling_   | -> | Node       |    +--------+
-// |                 |    +------------+    +------------+
-// |                 |                      | edge_      |
-// +-----------------+                      | index_ = 3 |
-//                                          | q_ = -0.2  |
-//                                          | sibling_   | -> nullptr
-//                                          +------------+
+// +-----------------+                      +--------+
+// | edges_          | -------------------> | Edge[] |
+// |                 |    +------------+    +--------+
+// | children_       | -> | Node[]     |    | Nf3    |
+// |                 |    +------------+    | Bc5    |
+// | ...             |    | edge_      |    | a4     |
+// |                 |    | index_ = 1 |    | Qxf7   |
+// |                 |    | wl_ = 0.5  |    | a3     |
+// |                 |    +------------+    +--------+
+// |                 |    |            |
+// |                 |    |            |
+// +-----------------+    |            |
+//                        +------------+
+//                        | edge_      |
+//                        | index_ = 3 |
+//                        | q_ = -0.2  |
+//                        +------------+
 
 // Define __i386__  or __arm__ also for 32 bit Windows.
 #if defined(_M_IX86)
@@ -91,78 +95,6 @@ namespace lczero {
 #if defined(_M_ARM) && !defined(_M_AMD64)
 #define __arm__
 #endif
-
-// Atomic unique_ptr based on the public domain code from
-// https://stackoverflow.com/a/42811152 .
-template <class T>
-class atomic_unique_ptr {
-  using pointer = T*;
-  using unique_pointer = std::unique_ptr<T>;
-
- public:
-  // Manage no pointer.
-  constexpr atomic_unique_ptr() noexcept : ptr() {}
-
-  // Make pointer @p managed.
-  explicit atomic_unique_ptr(pointer p) noexcept : ptr(p) {}
-
-  // Move the managed pointer ownership from another atomic_unique_ptr.
-  atomic_unique_ptr(atomic_unique_ptr&& p) noexcept : ptr(p.release()) {}
-  // Move the managed pointer ownership from another atomic_unique_ptr.
-  atomic_unique_ptr& operator=(atomic_unique_ptr&& p) noexcept {
-    reset(p.release());
-    return *this;
-  }
-
-  // Move the managed object ownership from a unique_ptr.
-  atomic_unique_ptr(unique_pointer&& p) noexcept : ptr(p.release()) {}
-  // Move the managed object ownership from a unique_ptr.
-  atomic_unique_ptr& operator=(unique_pointer&& p) noexcept {
-    reset(p.release());
-    return *this;
-  }
-
-  // Replace the managed pointer, deleting the old one.
-  void reset(pointer p = pointer()) noexcept {
-    auto old = ptr.exchange(p, std::memory_order_acquire);
-    if (old) delete old;
-  }
-  // Release ownership of and delete the owned pointer.
-  ~atomic_unique_ptr() { reset(); }
-
-  // Returns the managed pointer.
-  operator pointer() const noexcept { return ptr; }
-  // Returns the managed pointer.
-  pointer operator->() const noexcept { return ptr; }
-  // Returns the managed pointer.
-  pointer get() const noexcept { return ptr; }
-
-  // Checks whether there is a managed pointer.
-  explicit operator bool() const noexcept { return ptr != pointer(); }
-
-  // Replace the managed pointer, only releasing returning the old one.
-  pointer set(pointer p = pointer()) noexcept {
-    return ptr.exchange(p, std::memory_order_acquire);
-  }
-  // Return the managed pointer and release its ownership.
-  pointer release() noexcept { return set(pointer()); }
-
-  // Move managed pointer from @source, iff the managed pointer equals
-  // @expected.
-  bool compare_exchange(pointer expected,
-                        atomic_unique_ptr<T>& source) noexcept {
-    if (ptr.compare_exchange_strong(expected, source.ptr,
-                                    std::memory_order_acq_rel)) {
-      source.release();
-      return true;
-    } else {
-      return false;
-    }
-  }
-
- private:
-  std::atomic<pointer> ptr;
-};
 
 class Node;
 class Edge {
@@ -239,9 +171,8 @@ class Node {
   using ConstIterator = Edge_Iterator<true>;
 
   // Takes own @index in the parent.
-  Node(uint16_t index)
-      : index_(index),
-        terminal_type_(Terminal::NonTerminal),
+  Node()
+      : terminal_type_(Terminal::NonTerminal),
         lower_bound_(GameResult::BLACK_WON),
         upper_bound_(GameResult::WHITE_WON) {}
   // Takes own @edge and @index in the parent.
@@ -253,17 +184,19 @@ class Node {
         upper_bound_(GameResult::WHITE_WON) {}
   ~Node() { UnsetLowNode(); }
 
-  // Trim node, resetting everything except parent, sibling, edge and index.
+  // Atomics prevent use of the default move constructor version.
+  Node(Node&& move_from) { *this = std::move(move_from); }
+  // Atomics prevent use of the default move assignment version.
+  // Only works in the "constructed" state decided based on index_.
+  Node& operator=(Node&& move_from);
+
+  // Completely reset node to "constructed" state.
+  void Reset();
+  // Trim node, resetting everything except edge and index.
   void Trim();
 
   // Get first child.
   Node* GetChild() const;
-  // Get next sibling.
-  atomic_unique_ptr<Node>* GetSibling() { return &sibling_; }
-  // Moves sibling in.
-  void MoveSiblingIn(atomic_unique_ptr<Node>& sibling) {
-    sibling_ = std::move(sibling);
-  }
 
   // Returns whether a node has children.
   bool HasChildren() const;
@@ -369,6 +302,11 @@ class Node {
   // Index in parent's edges - useful for correlated ordering.
   uint16_t Index() const { return index_; }
 
+  // Check if node was realized (not just constructed).
+  bool Realized() const {
+    return index_.load(std::memory_order_acquire) < magic_index_assigned_;
+  }
+
  private:
   // To minimize the number of padding bytes and to avoid having unnecessary
   // padding when new fields are added, we arrange the fields by size, largest
@@ -385,8 +323,6 @@ class Node {
   // 8 byte fields on 64-bit platforms, 4 byte on 32-bit.
   // Pointer to the low node.
   LowNode* low_node_ = nullptr;
-  // Pointer to a next sibling. nullptr if there are no further siblings.
-  atomic_unique_ptr<Node> sibling_;
 
   // 4 byte fields.
   // Averaged draw probability. Works similarly to WL, except that D is not
@@ -405,8 +341,12 @@ class Node {
   Edge edge_;
 
   // 2 byte fields.
-  // Index of this node is parent's edge list.
-  uint16_t index_;
+  // Magic index constant - Node was constructed.
+  constexpr static uint16_t magic_index_constructed_ = 65535;
+  // Magic index constant - Node is being assigned.
+  constexpr static uint16_t magic_index_assigned_ = 32767;
+  // Index among parent's edges.
+  std::atomic<uint16_t> index_ = magic_index_constructed_;
 
   // 1 byte fields.
   // Bit fields using parts of uint8_t fields initialized in the constructor.
@@ -460,13 +400,16 @@ class LowNode {
         upper_bound_(GameResult::WHITE_WON),
         is_transposition(false) {
     edges_ = Edge::FromMovelist(moves);
-    child_ = std::make_unique<Node>(edges_[index], index);
+    new (&children_1_[0]) Node(edges_[index], index);
   }
+
+  // Manual memory allocation requires special destructor.
+  ~LowNode() { ReleaseChildren(); }
 
   void SetNNEval(const NNEval* eval) {
     assert(!edges_);
     assert(n_ == 0);
-    assert(!child_);
+    assert(n_in_flight_ == 0);
 
     edges_ = std::make_unique<Edge[]>(eval->num_edges);
     std::memcpy(edges_.get(), eval->edges.get(),
@@ -479,8 +422,8 @@ class LowNode {
     num_edges_ = eval->num_edges;
   }
 
-  // Gets the first child.
-  atomic_unique_ptr<Node>* GetChild() { return &child_; }
+  // Gets the first realized edge.
+  Node* GetChild();
 
   // Returns whether a node has children.
   bool HasChildren() const { return num_edges_ > 0; }
@@ -539,9 +482,8 @@ class LowNode {
   void ReleaseChildren();
 
   // Deletes all children except one.
-  // The node provided may be moved, so should not be relied upon to exist
-  // afterwards.
-  void ReleaseChildrenExceptOne(Node* node_to_save);
+  // The child provided will be moved!
+  void ReleaseChildrenExceptOne(Node* child_to_save);
 
   // Return move policy for edge/node at @index.
   const Edge& GetEdgeAt(uint16_t index) const;
@@ -553,7 +495,8 @@ class LowNode {
 
   void SortEdges() {
     assert(edges_);
-    assert(!child_);
+    assert(n_ == 0);
+
     Edge::SortEdges(edges_.get(), num_edges_);
   }
 
@@ -568,10 +511,28 @@ class LowNode {
   int GetNumParents() const { return num_parents_; }
   bool IsTransposition() const { return is_transposition; }
 
+  // Return realized edge at specified index, or nullptr.
+  Node* GetChildAt(uint16_t index);
+  // Return realized edge at specified index, creating it if necessary.
+  Node* InsertChildAt(uint16_t index);
+
  private:
+  // Find a place where an existing child at @index is in child arrays and
+  // return it.
+  Node* FindPlaceOf(uint16_t index);
+  // Allocate a new child array @children of specified @size when
+  // @already_allocated children were allocated (passed to avoid another load).
+  void Allocate(uint16_t size, uint16_t* already_allocated,
+                std::atomic<Node*>* children);
+
   // To minimize the number of padding bytes and to avoid having unnecessary
   // padding when new fields are added, we arrange the fields by size, largest
   // to smallest.
+
+  // Array of the first few real edges, preallocated here.
+  constexpr static size_t preallocated_children_ = 1;
+  constexpr static size_t children_1_end_ = preallocated_children_;
+  Node children_1_[preallocated_children_];
 
   // 8 byte fields.
   // Average value (from value head of neural network) of all visited nodes in
@@ -584,8 +545,15 @@ class LowNode {
   // 8 byte fields on 64-bit platforms, 4 byte on 32-bit.
   // Array of edges.
   std::unique_ptr<Edge[]> edges_;
-  // Pointer to the first child. nullptr when no children.
-  atomic_unique_ptr<Node> child_;
+
+  // Arrays with real edges with higher indexes, allocated on demand.
+  constexpr static size_t children_2_size_ = 4;
+  constexpr static size_t children_2_end_ = children_1_end_ + children_2_size_;
+  constexpr static size_t children_3_size_ = 8;
+  constexpr static size_t children_3_end_ = children_2_end_ + children_3_size_;
+  std::atomic<Node*> children_2_ = nullptr;
+  std::atomic<Node*> children_3_ = nullptr;
+  std::atomic<Node*> children_4_ = nullptr;  // num_edges_ - children_3_end_
 
   // 4 byte fields.
   // Averaged draw probability. Works similarly to WL, except that D is not
@@ -599,6 +567,8 @@ class LowNode {
   // but not finished). This value is added to n during selection which node
   // to pick in MCTS, and also when selecting the best move.
   std::atomic<uint32_t> n_in_flight_ = 0;
+  // How many realized children were already allocated.
+  std::atomic<uint16_t> allocated_children_ = preallocated_children_;
 
   // 1 byte fields.
   // Number of edges in @edges_.
@@ -615,8 +585,13 @@ class LowNode {
   bool is_transposition : 1;
 };
 
+// Check important field sizes.
+static_assert(sizeof(std::atomic<uint32_t>) <= 4,
+              "Unexpected uint32_t is too large.");
+static_assert(sizeof(std::atomic<uint16_t>) <= 2,
+              "Unexpected uint16_t atomic is too large.");
 // Check that LowNode still fits into an expected cache line size.
-static_assert(sizeof(LowNode) <= 64, "LowNode is too large");
+static_assert(sizeof(LowNode) <= 128, "LowNode is too large.");
 
 // Contains Edge and Node pair and set of proxy functions to simplify access
 // to them.
@@ -699,25 +674,21 @@ class EdgeAndNode {
 //
 // All functions are not thread safe (must be externally synchronized), but
 // it's fine if GetOrSpawnNode is called between calls to functions of the
-// iterator (e.g. advancing the iterator). Other functions that manipulate
-// child_ of parent or the sibling chain are not safe to call while iterating.
+// iterator (e.g. advancing the iterator).
 template <bool is_const>
 class Edge_Iterator : public EdgeAndNode {
  public:
-  using Ptr = std::conditional_t<is_const, const atomic_unique_ptr<Node>*,
-                                 atomic_unique_ptr<Node>*>;
-
   // Creates "end()" iterator.
   Edge_Iterator() {}
 
   // Creates "begin()" iterator.
   Edge_Iterator(LowNode* parent_node)
       : EdgeAndNode(parent_node != nullptr ? parent_node->GetEdges() : nullptr,
-                    nullptr) {
-    if (parent_node != nullptr) {
-      node_ptr_ = parent_node->GetChild();
+                    nullptr),
+        parent_node_(parent_node) {
+    if (edge_ != nullptr) {
+      node_ = parent_node_->GetChildAt(current_idx_);
       total_count_ = parent_node->GetNumEdges();
-      if (edge_) Actualize();
     }
   }
 
@@ -728,93 +699,30 @@ class Edge_Iterator : public EdgeAndNode {
   // Functions to support iterator interface.
   // Equality comparison operators are inherited from EdgeAndNode.
   void operator++() {
+    assert(parent_node_ != nullptr);
+
     // If it was the last edge in array, become end(), otherwise advance.
     if (++current_idx_ == total_count_) {
       edge_ = nullptr;
     } else {
       ++edge_;
-      Actualize();
+      node_ = parent_node_->GetChildAt(current_idx_);
     }
   }
   Edge_Iterator& operator*() { return *this; }
 
   // If there is node, return it. Otherwise spawn a new one and return it.
-  Node* GetOrSpawnNode(Node* parent) {
-    if (node_) return node_;  // If there is already a node, return it.
-
-    // We likely need to add a new node, prepare it now.
-    atomic_unique_ptr<Node> new_node = std::make_unique<Node>(
-        parent->GetLowNode()->GetEdgeAt(current_idx_), current_idx_);
-    while (true) {
-      auto node = Actualize();  // But maybe other thread already did that.
-      if (node_) return node_;  // If it did, return.
-
-      // New node needs to be added, but we might be in a race with another
-      // thread doing what we do or adding a different index to the same
-      // sibling.
-
-      // Suppose there are nodes with idx 3 and 7, and we want to insert one
-      // with idx 5. Here is how it looks like:
-      //    node_ptr_ -> &Node(idx_.3).sibling_  ->  Node(idx_.7)
-      // Here is how we do that:
-      // 1. Store pointer to a node idx_.7:
-      //    node_ptr_ -> &Node(idx_.3).sibling_  ->  nullptr
-      //    tmp -> Node(idx_.7)
-      // 2. Create fresh Node(idx_.5):
-      //    node_ptr_ -> &Node(idx_.3).sibling_  ->  Node(idx_.5)
-      //    tmp -> Node(idx_.7)
-      // 3. Attach stored pointer back to a list:
-      //    node_ptr_ ->
-      //         &Node(idx_.3).sibling_ -> Node(idx_.5).sibling_ -> Node(idx_.7)
-
-      // Atomically add the new node into the right place.
-      // Set new node's sibling to the expected sibling seen by Actualize in
-      // node_ptr_.
-      auto new_sibling = new_node->GetSibling();
-      new_sibling->set(node);
-      // Try to atomically insert the new node and stop if it works.
-      if (node_ptr_->compare_exchange(node, new_node)) break;
-      // Recover from failure and try again.
-      // Release expected sibling to avoid double free.
-      new_sibling->release();
+  Node* GetOrSpawnNode() {
+    assert(parent_node_ != nullptr);
+    if (node_ == nullptr) {
+      node_ = parent_node_->InsertChildAt(current_idx_);
     }
-    // 4. Actualize:
-    //    node_ -> &Node(idx_.5)
-    //    node_ptr_ -> &Node(idx_.5).sibling_ -> Node(idx_.7)
-    Actualize();
+
     return node_;
   }
 
  private:
-  // Moves node_ptr_ as close as possible to the target index and returns the
-  // contents of node_ptr_ for use by atomic insert in GetOrSpawnNode.
-  Node* Actualize() {
-    // If node_ptr_ is behind, advance it.
-    // This is needed (and has to be 'while' rather than 'if') as other threads
-    // could spawn new nodes between &node_ptr_ and *node_ptr_ while we didn't
-    // see.
-    // Read the direct pointer just once as other threads may change it between
-    // uses.
-    auto node = node_ptr_->get();
-    while (node != nullptr && node->Index() < current_idx_) {
-      node_ptr_ = node->GetSibling();
-      node = node_ptr_->get();
-    }
-    // If in the end node_ptr_ points to the node that we need, populate node_
-    // and advance node_ptr_.
-    if (node != nullptr && node->Index() == current_idx_) {
-      node_ = node;
-      node_ptr_ = node->GetSibling();
-    } else {
-      node_ = nullptr;
-    }
-
-    return node;
-  }
-
-  // Pointer to a pointer to the next node. Has to be a pointer to pointer
-  // as we'd like to update it when spawning a new node.
-  Ptr node_ptr_;
+  LowNode* parent_node_ = nullptr;
   uint16_t current_idx_ = 0;
   uint16_t total_count_ = 0;
 };
@@ -838,9 +746,9 @@ class VisitedNode_Iterator {
   VisitedNode_Iterator() {}
 
   // Creates "begin()" iterator.
-  VisitedNode_Iterator(LowNode* parent_node) {
+  VisitedNode_Iterator(LowNode* parent_node) : parent_node_(parent_node) {
     if (parent_node != nullptr) {
-      node_ptr_ = parent_node->GetChild()->get();
+      node_ptr_ = parent_node->GetChildAt(current_idx_);
       total_count_ = parent_node->GetNumEdges();
       if (node_ptr_ != nullptr && node_ptr_->GetN() == 0) {
         operator++();
@@ -861,10 +769,12 @@ class VisitedNode_Iterator {
   VisitedNode_Iterator<is_const> end() { return {}; }
 
   // Functions to support iterator interface.
-  // Equality comparison operators are inherited from EdgeAndNode.
   void operator++() {
+    assert(parent_node_ != nullptr);
+
     do {
-      node_ptr_ = node_ptr_->GetSibling()->get();
+      ++current_idx_;
+      node_ptr_ = parent_node_->GetChildAt(current_idx_);
       // If n started is 0, can jump direct to end due to sorted policy
       // ensuring that each time a new edge becomes best for the first time,
       // it is always the first of the section at the end that has NStarted of
@@ -879,6 +789,7 @@ class VisitedNode_Iterator {
   Node* operator*() { return node_ptr_; }
 
  private:
+  LowNode* parent_node_ = nullptr;
   // Pointer to current node.
   Node* node_ptr_ = nullptr;
   uint16_t current_idx_ = 0;
