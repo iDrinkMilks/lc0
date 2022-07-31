@@ -663,7 +663,7 @@ void LowNode::ReleaseChildrenExceptOne(
   // Release all children to maybe save memory.
   ReleaseChildren();
   // Recreate child.
-  auto new_child = InsertChildAt(saved_child.Index());
+  auto new_child = InsertChildAt(saved_child.Index(), false);
   *new_child = std::move(saved_child);
 }
 
@@ -734,7 +734,7 @@ void LowNode::Allocate(uint16_t size, uint16_t* already_allocated,
   }
 }
 
-Node* LowNode::InsertChildAt(uint16_t index) {  // Race expected.
+Node* LowNode::InsertChildAt(uint16_t index, bool init) {  // Race expected.
   assert(edges_);
   assert(index < num_edges_);
 
@@ -756,7 +756,7 @@ Node* LowNode::InsertChildAt(uint16_t index) {  // Race expected.
   Node* child = FindPlaceOf(index);
 
   // Realize child if needed.
-  if (!child->Realized()) {
+  if (init && !child->Realized()) {
     // This either succeeds or someone else is faster and does the same.
     *child = Node(edges_[index], index);
   }

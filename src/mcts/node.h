@@ -514,7 +514,8 @@ class LowNode {
   // Return realized edge at specified index, or nullptr.
   Node* GetChildAt(uint16_t index);
   // Return realized edge at specified index, creating it if necessary.
-  Node* InsertChildAt(uint16_t index);
+  // Initializes a new child if @init is true.
+  Node* InsertChildAt(uint16_t index, bool init = true);
 
  private:
   // Find a place where an existing child at @index is in child arrays and
