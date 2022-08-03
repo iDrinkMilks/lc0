@@ -409,7 +409,6 @@ class LowNode {
   void SetNNEval(const NNEval* eval) {
     assert(!edges_);
     assert(n_ == 0);
-    assert(n_in_flight_ == 0);
 
     edges_ = std::make_unique<Edge[]>(eval->num_edges);
     std::memcpy(edges_.get(), eval->edges.get(),
@@ -429,14 +428,7 @@ class LowNode {
   bool HasChildren() const { return num_edges_ > 0; }
 
   uint32_t GetN() const { return n_; }
-  uint32_t GetNInFlight() const {
-    return n_in_flight_.load(std::memory_order_acquire);
-  }
   uint32_t GetChildrenVisits() const { return n_ - 1; }
-  // Returns n + n_in_flight.
-  int GetNStarted() const {
-    return n_ + n_in_flight_.load(std::memory_order_acquire);
-  }
 
   // Returns node eval, i.e. average subtree V for non-terminal node and -1/0/1
   // for terminal nodes.
@@ -471,12 +463,6 @@ class LowNode {
   void FinalizeScoreUpdate(float v, float d, float m, int multivisit);
   // Like FinalizeScoreUpdate, but it updates n existing visits by delta amount.
   void AdjustForTerminal(float v, float d, float m, int multivisit);
-  // When search decides to treat one visit as several (in case of collisions
-  // or visiting terminal nodes several times), it amplifies the visit by
-  // incrementing n_in_flight.
-  void IncrementNInFlight(int multivisit) {
-    n_in_flight_.fetch_add(multivisit, std::memory_order_acq_rel);
-  }
 
   // Deletes all children.
   void ReleaseChildren();
@@ -501,13 +487,12 @@ class LowNode {
   }
 
   // Add new parent with @n_in_flight visits.
-  void AddParent(int n_in_flight) {
+  void AddParent() {
     ++num_parents_;
 
     assert(num_parents_ > 0);
 
     is_transposition |= num_parents_ > 1;
-    IncrementNInFlight(n_in_flight);
   }
   // Remove parent and its first visit.
   void RemoveParent() {
@@ -570,10 +555,6 @@ class LowNode {
   float m_ = 0.0f;
   // How many completed visits this node had.
   uint32_t n_ = 0;
-  // (AKA virtual loss.) How many threads currently process this node (started
-  // but not finished). This value is added to n during selection which node
-  // to pick in MCTS, and also when selecting the best move.
-  std::atomic<uint32_t> n_in_flight_ = 0;
   // How many realized children were already allocated.
   std::atomic<uint16_t> allocated_children_ = preallocated_children_;
 

@@ -245,8 +245,8 @@ std::string LowNode::DebugString() const {
   oss << " <LowNode> This:" << this << " Edges:" << edges_.get()
       << " NumEdges:" << static_cast<int>(num_edges_)
       << " AllocatedChildren:" << allocated_children_ << " WL:" << wl_
-      << " D:" << d_ << " M:" << m_ << " N:" << n_ << " N_:" << n_in_flight_
-      << " NP:" << num_parents_ << " Term:" << static_cast<int>(terminal_type_)
+      << " D:" << d_ << " M:" << m_ << " N:" << n_ << " NP:" << num_parents_
+      << " Term:" << static_cast<int>(terminal_type_)
       << " Bounds:" << static_cast<int>(lower_bound_) - 2 << ","
       << static_cast<int>(upper_bound_) - 2
       << " IsTransposition:" << is_transposition;
@@ -380,17 +380,11 @@ bool Node::TryStartScoreUpdate() {
       return false;
     }
   }
-  if (low_node_) low_node_->IncrementNInFlight(1);
+
   return true;
 }
 
-void LowNode::CancelScoreUpdate(int multivisit) {
-  assert(GetNInFlight() >= (uint32_t)multivisit);
-  n_in_flight_.fetch_sub(multivisit, std::memory_order_acq_rel);
-}
-
 void Node::CancelScoreUpdate(int multivisit) {
-  if (low_node_) low_node_->CancelScoreUpdate(multivisit);
   assert(GetNInFlight() >= (uint32_t)multivisit);
   n_in_flight_.fetch_sub(multivisit, std::memory_order_acq_rel);
 }
@@ -404,9 +398,6 @@ void LowNode::FinalizeScoreUpdate(float v, float d, float m, int multivisit) {
 
   // Increment N.
   n_ += multivisit;
-  // Decrement virtual loss.
-  assert(GetNInFlight() >= (uint32_t)multivisit);
-  n_in_flight_.fetch_sub(multivisit, std::memory_order_acq_rel);
 }
 
 void LowNode::AdjustForTerminal(float v, float d, float m, int multivisit) {
@@ -437,7 +428,6 @@ void Node::AdjustForTerminal(float v, float d, float m, int multivisit) {
 }
 
 void Node::IncrementNInFlight(int multivisit) {
-  if (low_node_) low_node_->IncrementNInFlight(multivisit);
   n_in_flight_.fetch_add(multivisit, std::memory_order_acq_rel);
 }
 
@@ -448,7 +438,7 @@ void Node::ReleaseChildrenExceptOne(Node* node_to_save) const {
 
 void Node::SetLowNode(LowNode* low_node) {
   assert(!low_node_);
-  low_node->AddParent(n_in_flight_);
+  low_node->AddParent();
   low_node_ = low_node;
 }
 void Node::UnsetLowNode() {
@@ -472,8 +462,7 @@ std::string LowNode::DotNodeString() const {
       << std::showpos    //
       << "WL=" << wl_    //
       << std::noshowpos  //
-      << "\\lD=" << d_ << "\\lM=" << m_ << "\\lN=" << n_
-      << "\\lN_=" << n_in_flight_ << "\\l\"";
+      << "\\lD=" << d_ << "\\lM=" << m_ << "\\lN=" << n_ << "\\l\"";
   // Set precision for tooltip.
   oss << std::fixed << std::showpos << std::setprecision(5);
   oss << ",tooltip=\""   //
@@ -481,7 +470,7 @@ std::string LowNode::DotNodeString() const {
       << "WL=" << wl_    //
       << std::noshowpos  //
       << "\\nD=" << d_ << "\\nM=" << m_ << "\\nN=" << n_
-      << "\\nN_=" << n_in_flight_ << "\\nNP=" << num_parents_
+      << "\\nNP=" << num_parents_
       << "\\nTerm=" << static_cast<int>(terminal_type_)  //
       << std::showpos                                    //
       << "\\nBounds=" << static_cast<int>(lower_bound_) - 2 << ","
@@ -577,7 +566,6 @@ bool Node::ZeroNInFlight() const {
   std::unordered_set<const LowNode*> seen;
   std::list<const Node*> unvisited_fifo;
   size_t nonzero_node_count = 0;
-  size_t nonzero_low_node_count = 0;
 
   if (GetNInFlight() > 0) {
     std::cerr << DebugString() << std::endl;
@@ -591,12 +579,6 @@ bool Node::ZeroNInFlight() const {
   while (!unvisited_fifo.empty()) {
     auto parent_node = unvisited_fifo.front();
     unvisited_fifo.pop_front();
-
-    auto parent_low_node = parent_node->GetLowNode();
-    if (parent_low_node->GetNInFlight() > 0) {
-      std::cerr << parent_low_node->DebugString() << std::endl;
-      ++nonzero_low_node_count;
-    }
 
     for (auto& child_edge : parent_node->Edges()) {
       auto child = child_edge.node();
@@ -616,10 +598,9 @@ bool Node::ZeroNInFlight() const {
     }
   }
 
-  if (nonzero_node_count + nonzero_low_node_count > 0) {
+  if (nonzero_node_count > 0) {
     std::cerr << "GetNInFlight() is nonzero on " << nonzero_node_count
-              << " nodes and " << nonzero_low_node_count << " low nodes"
-              << std::endl;
+              << " nodes" << std::endl;
     return false;
   }
 
