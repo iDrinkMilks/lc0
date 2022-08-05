@@ -30,6 +30,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -304,7 +305,7 @@ class Node {
 
   // Check if node was realized (not just constructed).
   bool Realized() const {
-    return index_.load(std::memory_order_acquire) < magic_index_assigned_;
+    return index_.load(std::memory_order_acquire) < kMagicIndexAssigned;
   }
 
  private:
@@ -342,11 +343,11 @@ class Node {
 
   // 2 byte fields.
   // Magic index constant - Node was constructed.
-  constexpr static uint16_t magic_index_constructed_ = 65535;
+  constexpr static uint16_t kMagicIndexConstructed = 65535;
   // Magic index constant - Node is being assigned.
-  constexpr static uint16_t magic_index_assigned_ = 32767;
+  constexpr static uint16_t kMagicIndexAssigned = 32767;
   // Index among parent's edges.
-  std::atomic<uint16_t> index_ = magic_index_constructed_;
+  std::atomic<uint16_t> index_ = kMagicIndexConstructed;
 
   // 1 byte fields.
   // Bit fields using parts of uint8_t fields initialized in the constructor.
@@ -360,6 +361,41 @@ class Node {
 
 // Check that Node still fits into an expected cache line size.
 static_assert(sizeof(Node) <= 64, "Node is too large");
+
+// Compute running sums for the @vals array. Initialize the sum with @init and
+// store results before adding the next value from @vals. Return array with
+// results. The result array is one item larger that @vals. (result[0] = init,
+// result[1] = init + vals[0])
+template <class T, size_t S>
+constexpr static std::array<T, S + 1> RunningSumsBefore(
+    T init, const std::array<T, S>& vals) {
+  std::array<size_t, S + 1> tmp{};
+  T sum = init;
+  size_t i = 0;
+  for (i = 0; i < S; ++i) {
+    tmp[i] = sum;
+    sum += vals[i];
+  }
+  tmp[i] = sum;
+
+  return tmp;
+}
+
+// Compute running sums for the @vals array. Initialize the sum with @init and
+// store results after adding the next value from @vals. Return array with
+// results. (result[0] = init + vals[0])
+template <class T, size_t S>
+constexpr static std::array<T, S> RunningSumsAfter(
+    T init, const std::array<T, S>& vals) {
+  std::array<size_t, S> tmp{};
+  T sum = init;
+  for (size_t i = 0; i < S; ++i) {
+    sum += vals[i];
+    tmp[i] = sum;
+  }
+
+  return tmp;
+}
 
 class LowNode {
  public:
@@ -400,7 +436,7 @@ class LowNode {
         upper_bound_(GameResult::WHITE_WON),
         is_transposition(false) {
     edges_ = Edge::FromMovelist(moves);
-    new (&children_1_[0]) Node(edges_[index], index);
+    new (&static_children_[0]) Node(edges_[index], index);
   }
 
   // Manual memory allocation requires special destructor.
@@ -509,6 +545,26 @@ class LowNode {
   Node* InsertChildAt(uint16_t index, bool init = true);
 
  private:
+  // How many children/realized edges are inlined here.
+  constexpr static size_t kStaticChildrenArraySize = 1;
+  // Number of dynamically allocated array for children/realized edges.
+  constexpr static size_t kDynamicChildrenArrayCount = 3;
+  // Sizes of dynamically allocated array for children/realized edges. All
+  // arrays have fixed size, except the last one that holds the rest of
+  // children/realized edges.
+  constexpr static std::array<size_t, kDynamicChildrenArrayCount - 1>
+      kDynamicChildrenArraySizes = {4, 8};
+  // Starts of dynamically allocated array for children/realized edges.
+  constexpr static std::array<size_t, kDynamicChildrenArrayCount>
+      kDynamicChildrenArrayStarts = RunningSumsBefore(
+          kStaticChildrenArraySize, kDynamicChildrenArraySizes);
+  // Ends of dynamically allocated array for children/realized edges.
+  constexpr static std::array<size_t, kDynamicChildrenArrayCount - 1>
+      kDynamicChildrenArrayEnds = RunningSumsAfter(kStaticChildrenArraySize,
+                                                   kDynamicChildrenArraySizes);
+  constexpr static size_t kDynamicChildrenArrayKnownTotalSize =
+      kDynamicChildrenArrayEnds.back();
+
   // Find a place where an existing child at @index is in child arrays and
   // return it.
   Node* FindPlaceOf(uint16_t index);
@@ -522,9 +578,7 @@ class LowNode {
   // to smallest.
 
   // Array of the first few real edges, preallocated here.
-  constexpr static size_t preallocated_children_ = 1;
-  constexpr static size_t children_1_end_ = preallocated_children_;
-  Node children_1_[preallocated_children_];
+  Node static_children_[kStaticChildrenArraySize];
 
   // 8 byte fields.
   // Average value (from value head of neural network) of all visited nodes in
@@ -538,14 +592,10 @@ class LowNode {
   // Array of edges.
   std::unique_ptr<Edge[]> edges_;
 
-  // Arrays with real edges with higher indexes, allocated on demand.
-  constexpr static size_t children_2_size_ = 4;
-  constexpr static size_t children_2_end_ = children_1_end_ + children_2_size_;
-  constexpr static size_t children_3_size_ = 8;
-  constexpr static size_t children_3_end_ = children_2_end_ + children_3_size_;
-  std::atomic<Node*> children_2_ = nullptr;
-  std::atomic<Node*> children_3_ = nullptr;
-  std::atomic<Node*> children_4_ = nullptr;  // num_edges_ - children_3_end_
+  // Arrays with children/real edges with higher indexes, allocated on demand.
+  // The last array num_edges_ - children_3_end_
+  std::array<std::atomic<Node*>, kDynamicChildrenArrayCount> dynamic_children_ =
+      {};
 
   // 4 byte fields.
   // Averaged draw probability. Works similarly to WL, except that D is not
@@ -555,10 +605,10 @@ class LowNode {
   float m_ = 0.0f;
   // How many completed visits this node had.
   uint32_t n_ = 0;
-  // How many realized children were already allocated.
-  std::atomic<uint16_t> allocated_children_ = preallocated_children_;
 
   // 2 byte fields.
+  // How many realized children were already allocated.
+  std::atomic<uint16_t> allocated_children_ = kStaticChildrenArraySize;
   // Number of parents.
   uint16_t num_parents_ = 0;
 

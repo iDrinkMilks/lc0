@@ -126,8 +126,8 @@ Node& Node::operator=(Node&& move_from) {  // Race expected.
   assert(move_from.Realized());
 
   // Try to lock others out.
-  uint16_t expected_index = magic_index_constructed_;
-  if (!index_.compare_exchange_strong(expected_index, magic_index_assigned_)) {
+  uint16_t expected_index = kMagicIndexConstructed;
+  if (!index_.compare_exchange_strong(expected_index, kMagicIndexAssigned)) {
     // Someone was faster, wait for them to finish.
     do {
       // EMPTY
@@ -175,7 +175,7 @@ void Node::Reset() {  // No race expected.
 
   edge_ = Edge();
 
-  index_.store(magic_index_constructed_, std::memory_order_relaxed);
+  index_.store(kMagicIndexConstructed, std::memory_order_relaxed);
 
   terminal_type_ = Terminal::NonTerminal;
   lower_bound_ = GameResult::BLACK_WON;
@@ -616,23 +616,28 @@ void LowNode::ReleaseChildren() {  // No race expected.
   auto allocated = allocated_children_.load(std::memory_order_relaxed);
   std::allocator<Node> alloc;
 
-  if (allocated > children_3_end_) {
-    auto children = children_4_.exchange(nullptr, std::memory_order_release);
-    alloc.deallocate(children, allocated - children_3_end_);
-  }
-  if (allocated > children_2_end_) {
-    auto children = children_3_.exchange(nullptr, std::memory_order_release);
-    alloc.deallocate(children, children_3_size_);
-  }
-  if (allocated > children_1_end_) {
-    auto children = children_2_.exchange(nullptr, std::memory_order_release);
-    alloc.deallocate(children, children_2_size_);
-  }
-  for (uint16_t i = 0; i < children_1_end_; ++i) {
-    children_1_[i].Reset();
+  // Reset all statically allocated children.
+  for (uint16_t i = 0; i < kStaticChildrenArraySize; ++i) {
+    static_children_[i].Reset();
   }
 
-  allocated_children_.store(preallocated_children_, std::memory_order_relaxed);
+  // Free all arrays for dynamically allocated children.
+  for (size_t i = 0; i < kDynamicChildrenArrayCount; ++i) {
+    auto array =
+        dynamic_children_[i].exchange(nullptr, std::memory_order_relaxed);
+    if (array != nullptr) {
+      // All but the last array are of a known constant size.
+      if (i == kDynamicChildrenArrayCount - 1) {
+        alloc.deallocate(array,
+                         allocated - kDynamicChildrenArrayKnownTotalSize);
+      } else {
+        alloc.deallocate(array, kDynamicChildrenArraySizes[i]);
+      }
+    }
+  }
+
+  allocated_children_.store(kStaticChildrenArraySize,
+                            std::memory_order_relaxed);
 }
 
 void LowNode::ReleaseChildrenExceptOne(
@@ -658,15 +663,19 @@ Node* LowNode::GetChild() {
 
 Node* LowNode::FindPlaceOf(uint16_t index) {
   // Find the right child group for the index.
-  if (index < children_1_end_) {
-    return &children_1_[index];
-  } else if (index < children_2_end_) {
-    return &children_2_[index - children_1_end_];
-  } else if (index < children_3_end_) {
-    return &children_3_[index - children_2_end_];
-  } else {
-    return &children_4_[index - children_3_end_];
+  if (index < kStaticChildrenArraySize) {
+    return &static_children_[index];
   }
+
+  // constexpr
+  size_t i = 0;
+  while (i < kDynamicChildrenArrayCount - 1 &&
+         index >= kDynamicChildrenArrayEnds[i]) {
+    ++i;
+  }
+
+  auto children = dynamic_children_[i].load(std::memory_order_acquire);
+  return &children[index - kDynamicChildrenArrayStarts[i]];
 }
 
 Node* LowNode::GetChildAt(uint16_t index) {  // Race expected.
@@ -721,14 +730,18 @@ Node* LowNode::InsertChildAt(uint16_t index, bool init) {  // Race expected.
   // Allocate memory for all missing child arrays needed.
   auto allocated = allocated_children_.load(std::memory_order_acquire);
   if (index >= allocated) {
-    if (allocated < children_2_end_) {
-      Allocate(children_2_size_, &allocated, &children_2_);
+    // Allocate memory for all missing child arrays needed.
+    size_t i;
+    for (i = 0; i < kDynamicChildrenArrayCount - 1 && index >= allocated; ++i) {
+      if (allocated < kDynamicChildrenArrayEnds[i]) {
+        Allocate(kDynamicChildrenArraySizes[i], &allocated,
+                 &dynamic_children_[i]);
+      }
     }
-    if (index >= allocated && allocated < children_3_end_) {
-      Allocate(children_3_size_, &allocated, &children_3_);
-    }
-    if (index >= allocated) {
-      Allocate(num_edges_ - children_3_end_, &allocated, &children_4_);
+
+    if (i == kDynamicChildrenArrayCount - 1 && index >= allocated) {
+      Allocate(num_edges_ - kDynamicChildrenArrayKnownTotalSize, &allocated,
+               &dynamic_children_[i]);
     }
   }
 
