@@ -546,14 +546,14 @@ class LowNode {
 
  private:
   // How many children/realized edges are inlined here.
-  constexpr static size_t kStaticChildrenArraySize = 1;
+  constexpr static size_t kStaticChildrenArraySize = 2;
   // Number of dynamically allocated array for children/realized edges.
-  constexpr static size_t kDynamicChildrenArrayCount = 3;
+  constexpr static size_t kDynamicChildrenArrayCount = 1;
   // Sizes of dynamically allocated array for children/realized edges. All
   // arrays have fixed size, except the last one that holds the rest of
   // children/realized edges.
   constexpr static std::array<size_t, kDynamicChildrenArrayCount - 1>
-      kDynamicChildrenArraySizes = {4, 8};
+      kDynamicChildrenArraySizes = {};
   // Starts of dynamically allocated array for children/realized edges.
   constexpr static std::array<size_t, kDynamicChildrenArrayCount>
       kDynamicChildrenArrayStarts = RunningSumsBefore(
@@ -563,7 +563,7 @@ class LowNode {
       kDynamicChildrenArrayEnds = RunningSumsAfter(kStaticChildrenArraySize,
                                                    kDynamicChildrenArraySizes);
   constexpr static size_t kDynamicChildrenArrayKnownTotalSize =
-      kDynamicChildrenArrayEnds.back();
+      kStaticChildrenArraySize;  // kDynamicChildrenArrayEnds.back();
 
   // Find a place where an existing child at @index is in child arrays and
   // return it.
