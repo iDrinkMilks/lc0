@@ -616,10 +616,12 @@ void LowNode::ReleaseChildren() {  // No race expected.
   auto allocated = allocated_children_.load(std::memory_order_relaxed);
   std::allocator<Node> alloc;
 
+#if STATIC_CHILDREN_ARRAY_SIZE > 0
   // Reset all statically allocated children.
   for (uint16_t i = 0; i < kStaticChildrenArraySize; ++i) {
     static_children_[i].Reset();
   }
+#endif
 
   // Free all arrays for dynamically allocated children.
   for (size_t i = 0; i < kDynamicChildrenArrayCount; ++i) {
@@ -662,10 +664,12 @@ Node* LowNode::GetChild() {
 }
 
 Node* LowNode::FindPlaceOf(uint16_t index) {
+#if STATIC_CHILDREN_ARRAY_SIZE > 0
   // Find the right child group for the index.
   if (index < kStaticChildrenArraySize) {
     return &static_children_[index];
   }
+#endif
 
   // constexpr
   size_t i = 0;

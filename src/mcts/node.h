@@ -436,7 +436,7 @@ class LowNode {
         upper_bound_(GameResult::WHITE_WON),
         is_transposition(false) {
     edges_ = Edge::FromMovelist(moves);
-    new (&static_children_[0]) Node(edges_[index], index);
+    InsertChildAt(index);
   }
 
   // Manual memory allocation requires special destructor.
@@ -546,7 +546,8 @@ class LowNode {
 
  private:
   // How many children/realized edges are inlined here.
-  constexpr static size_t kStaticChildrenArraySize = 2;
+#define STATIC_CHILDREN_ARRAY_SIZE 2
+  constexpr static size_t kStaticChildrenArraySize = STATIC_CHILDREN_ARRAY_SIZE;
   // Number of dynamically allocated array for children/realized edges.
   constexpr static size_t kDynamicChildrenArrayCount = 1;
   // Sizes of dynamically allocated array for children/realized edges. All
@@ -577,8 +578,10 @@ class LowNode {
   // padding when new fields are added, we arrange the fields by size, largest
   // to smallest.
 
+#if STATIC_CHILDREN_ARRAY_SIZE > 0
   // Array of the first few real edges, preallocated here.
   Node static_children_[kStaticChildrenArraySize];
+#endif
 
   // 8 byte fields.
   // Average value (from value head of neural network) of all visited nodes in
