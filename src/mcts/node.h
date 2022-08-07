@@ -546,7 +546,8 @@ class LowNode {
 
  private:
   // How many children/realized edges are inlined here.
-  constexpr static size_t kStaticChildrenArraySize = 1;
+#define STATIC_CHILDREN_ARRAY_SIZE 1
+  constexpr static size_t kStaticChildrenArraySize = STATIC_CHILDREN_ARRAY_SIZE;
   // Number of dynamically allocated array for children/realized edges.
   constexpr static size_t kDynamicChildrenArrayCount = 3;
   // Sizes of dynamically allocated array for children/realized edges. All
@@ -577,8 +578,10 @@ class LowNode {
   // padding when new fields are added, we arrange the fields by size, largest
   // to smallest.
 
+#if STATIC_CHILDREN_ARRAY_SIZE > 0
   // Array of the first few real edges, preallocated here.
   Node static_children_[kStaticChildrenArraySize];
+#endif
 
   // 8 byte fields.
   // Average value (from value head of neural network) of all visited nodes in
