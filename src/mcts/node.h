@@ -436,7 +436,7 @@ class LowNode {
         upper_bound_(GameResult::WHITE_WON),
         is_transposition(false) {
     edges_ = Edge::FromMovelist(moves);
-    new (&static_children_[0]) Node(edges_[index], index);
+    InsertChildAt(index);
   }
 
   // Manual memory allocation requires special destructor.
