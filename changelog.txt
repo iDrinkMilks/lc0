@@ -1094,3 +1094,4 @@ Visible changes:
 
 Invisible changes:
 * Store castlings again as e1g1 and not e1h1. Fixes a bug that tree was not reused after castling.
+3
